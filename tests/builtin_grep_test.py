@@ -5,7 +5,8 @@ import tempfile
 from unittest.async_case import IsolatedAsyncioTestCase
 
 from agentscope.message import ToolResultState
-from agentscope.tool import Grep
+from agentscope.tool import Grep, ToolChunk
+from agentscope.tool._builtin._backend import BackendBase, ExecResult
 from agentscope.permission import (
     PermissionContext,
     PermissionBehavior,
@@ -252,3 +253,142 @@ class GrepToolTest(IsolatedAsyncioTestCase):
         expected_pattern = os.path.abspath(cwd).rstrip("/") + "/**"
         suggestion_contents = [s.rule_content for s in suggestions]
         self.assertIn(expected_pattern, suggestion_contents)
+
+
+class _UnstableRipgrepBackend(BackendBase):
+    """A backend emulating ripgrep's ordering contract.
+
+    Without ``--sort``, ripgrep's parallel walker returns matches in a
+    different order on every invocation; this stub reproduces that by
+    rotating the results once per call. With ``--sort``, ripgrep
+    guarantees a stable order instead.
+    """
+
+    def __init__(self, search_dir: str) -> None:
+        self.search_dir = search_dir
+        self.calls = 0
+
+    async def exec_shell(
+        self,
+        command: list[str],
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ) -> ExecResult:
+        self.calls += 1
+        search_path = command[-1]
+        lines = []
+        for name in sorted(os.listdir(self.search_dir)):
+            file_path = os.path.join(self.search_dir, name)
+            if not os.path.isfile(file_path):
+                continue
+            with open(file_path, encoding="utf-8") as f:
+                first_line = f.readline().strip()
+            lines.append(
+                f"{os.path.join(search_path, name)}:1:{first_line}",
+            )
+        if lines and not any(
+            arg == "--sort" or arg.startswith("--sort=") for arg in command
+        ):
+            shift = self.calls % len(lines)
+            lines = lines[shift:] + lines[:shift]
+        return ExecResult(
+            0,
+            ("\n".join(lines) + "\n").encode("utf-8"),
+            b"",
+        )
+
+    async def read_file(self, path: str) -> bytes:
+        raise NotImplementedError
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        raise NotImplementedError
+
+
+class GrepPaginationTest(IsolatedAsyncioTestCase):
+    """Offset pagination must not lose or duplicate matches."""
+
+    async def asyncSetUp(self) -> None:
+        """The async setup method."""
+        self.temp_dir = tempfile.mkdtemp()
+        for i in range(6):
+            with open(
+                os.path.join(self.temp_dir, f"file{i}.py"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write(f"NEEDLE{i}\n")
+
+    async def asyncTearDown(self) -> None:
+        """Clean up temporary files."""
+        import shutil
+
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
+    @staticmethod
+    def _needles(chunk: ToolChunk) -> list[str]:
+        """Extract the NEEDLE marker of each matching line."""
+        return [
+            line.rsplit(":", 1)[-1]
+            for line in chunk.content[0].text.splitlines()
+            if ":NEEDLE" in line
+        ]
+
+    async def test_offset_pagination_keeps_every_match(self) -> None:
+        """Paging with offset must return each match exactly once.
+
+        rg returns matches in a different order on every invocation
+        unless it is told to sort, so slicing with ``offset`` skips a
+        different "first N" on every page and matches get lost from
+        the paginated output while others appear on two pages.
+        """
+        grep_tool = Grep(backend=_UnstableRipgrepBackend(self.temp_dir))
+
+        full = await grep_tool(
+            pattern="NEEDLE",
+            path=self.temp_dir,
+            output_mode="content",
+            head_limit=0,
+        )
+        page1 = await grep_tool(
+            pattern="NEEDLE",
+            path=self.temp_dir,
+            output_mode="content",
+            head_limit=3,
+            offset=0,
+        )
+        page2 = await grep_tool(
+            pattern="NEEDLE",
+            path=self.temp_dir,
+            output_mode="content",
+            head_limit=3,
+            offset=3,
+        )
+
+        # Every match must appear on exactly one page, in order.
+        self.assertEqual(
+            self._needles(page1) + self._needles(page2),
+            self._needles(full),
+        )
+
+    async def test_results_are_sorted_by_path(self) -> None:
+        """Results must come back in a stable, path-sorted order."""
+        grep_tool = Grep()
+
+        first = await grep_tool(
+            pattern="NEEDLE",
+            path=self.temp_dir,
+            output_mode="content",
+            head_limit=0,
+        )
+        second = await grep_tool(
+            pattern="NEEDLE",
+            path=self.temp_dir,
+            output_mode="content",
+            head_limit=0,
+        )
+
+        needles = self._needles(first)
+        self.assertEqual(needles, sorted(needles))
+        self.assertEqual(self._needles(second), needles)

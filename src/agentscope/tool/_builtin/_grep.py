@@ -384,6 +384,11 @@ class Grep(ToolBase):
         # Limit line length to prevent base64/minified content
         args.extend(["--max-columns", "500"])
 
+        # Sort by file path so head_limit/offset pagination is stable
+        # across calls (rg's parallel walker otherwise returns matches
+        # in a different order on every invocation).
+        args.extend(["--sort", "path"])
+
         # Multiline mode
         if multiline:
             args.extend(["-U", "--multiline-dotall"])
